@@ -1,0 +1,382 @@
+#! /usr/bin/env python3
+"""Run MLST against all relevant schemes for an organism."""
+import gzip
+import logging
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+
+VERSION = "0.1.0"
+PROGRAM = "gigatyper"
+
+import rich_click as click
+from rich.logging import RichHandler
+click.rich_click.USE_RICH_MARKUP = True
+click.rich_click.OPTION_GROUPS = {
+    "gigatyper": [
+        {
+            "name": "Required Options",
+            "options": ["--input"],
+        },
+        {
+            "name": "Helpful Options",
+            "options": [
+                "--prefix",
+                "--threads",
+                "--species",
+            ],
+        },
+        {
+            "name": "Additional Options",
+            "options": [
+                "--verbose",
+                "--silent",
+                "--check",
+                "--version",
+                "--help",
+            ],
+        },
+    ]
+}
+
+# Additional scheme relationships not derivable from name grouping
+ADDITIONAL_SCHEMES = {
+    "mabscessus": ["mycobacteria_2"],
+    "mycobacteria_2": ["mabscessus"],
+}
+
+# Display name overrides where dynamic loci-prefix derivation fails
+SCHEME_DISPLAY_NAMES = {
+    "abaumannii": "Oxford",
+    "abaumannii_2": "Pasteur",
+    "ecoli": "Pasteur",
+    "ecoli_achtman_4": "Achtman",
+}
+
+# Genus-based corrections for mlst auto-detection quirks
+GENUS_CORRECTIONS = {
+    "escherichia": {
+        "replace": {"aeromonas", "cfreundii", "senterica_achtman_2"},
+        "with": ["ecoli", "ecoli_achtman_4"],
+    },
+    "enterobacter": {
+        "replace": {"cronobacter"},
+        "with": ["ecloacae"],
+    },
+}
+
+
+def check_dependencies():
+    """Verify that mlst is available in PATH."""
+    error = 0
+    if not shutil.which("mlst"):
+        logging.error("'mlst' not found in PATH. Please install mlst.")
+        error = 1
+    else:
+        logging.info("'mlst' found in PATH")
+    logging.info("Dependency check complete, exiting.")
+    sys.exit(error)
+
+
+def execute(cmd):
+    """Run a command and return stdout, exiting on failure."""
+    logging.debug(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logging.error(f"Command failed (exit {result.returncode}): {' '.join(cmd)}")
+        logging.error(result.stderr.strip())
+        sys.exit(result.returncode)
+    logging.debug(f"stdout: {result.stdout.strip()}")
+    return result.stdout
+
+
+def parse_mlst_info():
+    """Parse `mlst --info` and return dict of scheme_name → loci_names list."""
+    output = execute(["mlst", "--info"])
+    schemes = {}
+    for line in output.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        name = parts[0].strip()
+        if not name or not name[0].islower():
+            continue
+        loci_names = parts[5].strip().split() if len(parts) > 5 else []
+        schemes[name] = loci_names
+    logging.debug(f"Parsed {len(schemes)} schemes from mlst --info")
+    return schemes
+
+
+def build_scheme_groups(scheme_names):
+    """Group related schemes by shared base name prefix.
+
+    Schemes like abaumannii and abaumannii_2, or salmonella_Oxford and
+    salmonella_Achtman, share a common base before the first underscore.
+    Groups with only one member are excluded (no alternates needed).
+    """
+    prefix_groups = defaultdict(list)
+    for name in scheme_names:
+        base = name.split("_", 1)[0] if "_" in name else name
+        prefix_groups[base].append(name)
+    return {base: sorted(members) for base, members in prefix_groups.items() if len(members) > 1}
+
+
+def build_scheme_pairs(scheme_groups):
+    """Build scheme → alternates mapping from groups + additional hardcoded links."""
+    pairs = {}
+    for members in scheme_groups.values():
+        for scheme in members:
+            pairs[scheme] = [s for s in members if s != scheme]
+
+    for scheme, additional in ADDITIONAL_SCHEMES.items():
+        if scheme in pairs:
+            for a in additional:
+                if a not in pairs[scheme]:
+                    pairs[scheme].append(a)
+        else:
+            pairs[scheme] = list(additional)
+
+    return pairs
+
+
+def find_schemes_for_species(species_str, all_scheme_names, scheme_groups):
+    """Match a species name to its mlst schemes.
+
+    Tries genus[0]+species first (e.g. "ecoli"), then full genus name
+    (e.g. "salmonella") to find matching scheme groups.
+    """
+    parts = species_str.strip().lower().split()
+    if len(parts) < 2:
+        return []
+
+    genus, species = parts[0], parts[1]
+
+    for candidate in [genus[0] + species, genus]:
+        # Check multi-scheme groups first
+        if candidate in scheme_groups:
+            schemes = list(scheme_groups[candidate])
+            for s in list(schemes):
+                for a in ADDITIONAL_SCHEMES.get(s, []):
+                    if a not in schemes:
+                        schemes.append(a)
+            return sorted(schemes)
+
+        # Check standalone schemes
+        if candidate in all_scheme_names:
+            schemes = [candidate]
+            schemes.extend(ADDITIONAL_SCHEMES.get(candidate, []))
+            return sorted(set(schemes))
+
+    return []
+
+
+def get_display_name(scheme_name, scheme_loci):
+    """Derive a display name for a scheme.
+
+    Priority: hardcoded override → loci prefix expansion → scheme name as-is.
+    """
+    if scheme_name in SCHEME_DISPLAY_NAMES:
+        return SCHEME_DISPLAY_NAMES[scheme_name]
+
+    loci = scheme_loci.get(scheme_name, [])
+    if loci:
+        prefixes = set()
+        for locus in loci:
+            if "_" in locus:
+                prefixes.add(locus.split("_", 1)[0])
+            else:
+                prefixes = set()
+                break
+        if len(prefixes) == 1:
+            return prefixes.pop()
+
+    return scheme_name
+
+
+def decompress_fasta(input_path):
+    """Decompress a gzipped FASTA file to a temporary file. Returns (path, is_temp)."""
+    if str(input_path).endswith(".gz"):
+        tmp = tempfile.NamedTemporaryFile(suffix=".fasta", delete=False)
+        logging.debug(f"Decompressing {input_path}")
+        with gzip.open(input_path, "rb") as f_in, open(tmp.name, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        return Path(tmp.name), True
+    return input_path, False
+
+
+def run_mlst(fasta, threads, scheme=None):
+    """Run mlst --full and return stdout."""
+    cmd = ["mlst", "--full", "--threads", str(threads)]
+    if scheme:
+        cmd.extend(["--scheme", scheme])
+    cmd.append(str(fasta))
+    logging.info(f"Running mlst{f' --scheme {scheme}' if scheme else ' (auto-detect)'}")
+    return execute(cmd)
+
+
+def parse_mlst_line(line):
+    """Parse a single mlst --full output line into a dict."""
+    parts = line.strip().split("\t")
+    if len(parts) < 6:
+        return None
+    if parts[0] == "FILE":
+        return None
+    return {
+        "file": parts[0],
+        "scheme": parts[1],
+        "st": parts[2],
+        "status": parts[3],
+        "score": parts[4],
+        "alleles": parts[5] if len(parts) > 5 else "",
+    }
+
+
+def format_mlst_report(scheme, st, scheme_loci):
+    """Format the MLST result per CDC/PHL reporting conventions."""
+    if scheme == "-":
+        return ""
+    display_name = get_display_name(scheme, scheme_loci)
+    if st == "-":
+        return f"MLST_unnamed_{display_name}"
+    return f"MLST_{st}_{display_name}"
+
+
+def get_alternate_schemes(scheme, genus, scheme_pairs):
+    """Determine alternate schemes to run and whether to replace the initial result."""
+    if genus in GENUS_CORRECTIONS:
+        correction = GENUS_CORRECTIONS[genus]
+        if scheme in correction["replace"]:
+            logging.info(
+                f"Scheme '{scheme}' appears incorrect for genus '{genus}', "
+                f"replacing with: {correction['with']}"
+            )
+            return correction["with"], True
+
+    if scheme in scheme_pairs:
+        alternates = scheme_pairs[scheme]
+        logging.info(f"Running alternate scheme(s): {alternates}")
+        return alternates, False
+
+    return [], False
+
+
+@click.command()
+@click.version_option(VERSION, "--version", "-V")
+@click.option("--input", "input_fasta", help="Input FASTA file (supports .gz)")
+@click.option("--prefix", default="gigatyper", show_default=True, help="Prefix to be used for naming results")
+@click.option("--threads", default=1, show_default=True, help="Number of threads for mlst")
+@click.option("--species", default="", help="Force a species scheme (e.g. 'Escherichia coli')")
+@click.option("--verbose", is_flag=True, default=False, help="Enable debug logging")
+@click.option("--silent", is_flag=True, default=False, help="Suppress all log output")
+@click.option("--check", is_flag=True, default=False, help="Run dependency checks and exit")
+def gigatyper(input_fasta, prefix, threads, species, verbose, silent, check):
+    """Run MLST against all relevant schemes for an organism."""
+    # Set up logging to stderr
+    log_level = logging.ERROR if silent else (logging.DEBUG if verbose else logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=__import__("rich.console", fromlist=["Console"]).Console(stderr=True))],
+    )
+
+    logging.info(f"{PROGRAM} v{VERSION}")
+    if check:
+        check_dependencies()
+
+    if not input_fasta:
+        logging.error("No input FASTA provided. Use --input to specify a file.")
+        sys.exit(1)
+    elif not Path(input_fasta).exists():
+        logging.error(f"Input file not found: {input_fasta}")
+        sys.exit(1)
+
+    # Parse mlst --info for dynamic scheme data
+    scheme_loci = parse_mlst_info()
+    all_scheme_names = set(scheme_loci.keys())
+    scheme_groups = build_scheme_groups(all_scheme_names)
+    scheme_pairs = build_scheme_pairs(scheme_groups)
+    logging.debug(f"Found {len(all_scheme_names)} schemes, {len(scheme_groups)} multi-scheme groups")
+
+    # Parse species into genus
+    genus = ""
+    if species:
+        parts = species.strip().split()
+        genus = parts[0].lower() if parts else ""
+        logging.info(f"Species: {species} (genus={genus})")
+
+    # Decompress if needed
+    input_path = Path(input_fasta)
+    fasta, is_temp = decompress_fasta(input_path)
+    file_name = str(input_path) if is_temp else input_fasta
+
+    try:
+        results = []
+
+        if species:
+            # Mode 1: --species provided, find and run all matching schemes
+            schemes = find_schemes_for_species(species, all_scheme_names, scheme_groups)
+            if schemes:
+                logging.info(f"Running {len(schemes)} scheme(s) for '{species}': {schemes}")
+                for scheme in schemes:
+                    output = run_mlst(fasta, threads, scheme=scheme)
+                    for line in output.strip().splitlines():
+                        parsed = parse_mlst_line(line)
+                        if parsed:
+                            results.append(parsed)
+            else:
+                logging.warning(f"No schemes found for '{species}', falling back to auto-detect")
+                species = ""  # fall through to auto-detect
+
+        if not species:
+            # Mode 2: auto-detect, then run alternates
+            output = run_mlst(fasta, threads)
+            for line in output.strip().splitlines():
+                parsed = parse_mlst_line(line)
+                if parsed:
+                    detected_scheme = parsed["scheme"]
+                    logging.info(f"Auto-detected scheme: ['{detected_scheme}']")
+                    alternates, replace = get_alternate_schemes(detected_scheme, genus, scheme_pairs)
+                    if replace:
+                        for alt_scheme in alternates:
+                            alt_output = run_mlst(fasta, threads, scheme=alt_scheme)
+                            for alt_line in alt_output.strip().splitlines():
+                                alt_parsed = parse_mlst_line(alt_line)
+                                if alt_parsed:
+                                    results.append(alt_parsed)
+                    else:
+                        results.append(parsed)
+                        for alt_scheme in alternates:
+                            alt_output = run_mlst(fasta, threads, scheme=alt_scheme)
+                            for alt_line in alt_output.strip().splitlines():
+                                alt_parsed = parse_mlst_line(alt_line)
+                                if alt_parsed:
+                                    results.append(alt_parsed)
+
+        # Print header + results to stdout
+        print("sample\tfile\tscheme\tst\tstatus\tscore\talleles\tformatted_report")
+        if not results:
+            print(f"{prefix}\t{file_name}\t-\t-\tNo valid MLST results\t-\t-\t")
+        else:
+            for r in results:
+                report = format_mlst_report(r["scheme"], r["st"], scheme_loci)
+                print(f"{prefix}\t{file_name}\t{r['scheme']}\t{r['st']}\t{r['status']}\t{r['score']}\t{r['alleles']}\t{report}")
+
+    finally:
+        if is_temp:
+            Path(fasta).unlink(missing_ok=True)
+            logging.debug(f"Cleaned up temporary file: {fasta}")
+
+
+def main():
+    gigatyper()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        gigatyper.main(['--help'])
+    else:
+        gigatyper()
