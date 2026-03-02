@@ -13,6 +13,7 @@ VERSION = "0.1.0"
 PROGRAM = "gigatyper"
 
 import rich_click as click
+from rich.console import Console
 from rich.logging import RichHandler
 click.rich_click.USE_RICH_MARKUP = True
 click.rich_click.OPTION_GROUPS = {
@@ -230,7 +231,7 @@ def parse_mlst_line(line):
         "st": parts[2],
         "status": parts[3],
         "score": parts[4],
-        "alleles": parts[5] if len(parts) > 5 else "",
+        "alleles": "\t".join(parts[5:]),
     }
 
 
@@ -280,7 +281,7 @@ def gigatyper(input_fasta, prefix, threads, species, verbose, silent, check):
         level=log_level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=__import__("rich.console", fromlist=["Console"]).Console(stderr=True))],
+        handlers=[RichHandler(console=Console(stderr=True))],
     )
 
     logging.info(f"{PROGRAM} v{VERSION}")
@@ -292,6 +293,11 @@ def gigatyper(input_fasta, prefix, threads, species, verbose, silent, check):
         sys.exit(1)
     elif not Path(input_fasta).exists():
         logging.error(f"Input file not found: {input_fasta}")
+        sys.exit(1)
+
+    # Verify mlst is available before proceeding
+    if not shutil.which("mlst"):
+        logging.error("'mlst' not found in PATH. Please install mlst.")
         sys.exit(1)
 
     # Parse mlst --info for dynamic scheme data
