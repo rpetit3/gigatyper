@@ -38,11 +38,9 @@ gigatyper --input ecoli.fna.gz > ecoli.txt
 _Note: Bioconda install coming soon!_
 
 ```bash
-conda create -n gigatyper 'python=3.12' rich-click mlst
+conda create -n gigatyper -c conda-forge -c bioconda gigatyper
 conda activate gigatyper
-wget https://raw.githubusercontent.com/rpetit3/gigatyper/refs/heads/main/bin/gigatyper
-chmod 755 gigatyper
-./gigatyper --help
+gigatyper --help
 ```
 
 ## Usage
