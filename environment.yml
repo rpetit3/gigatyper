@@ -1,0 +1,10 @@
+name: gigatyper-dev
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - mlst
+  - pytest
+  - python=3.12
+  - rich-click
